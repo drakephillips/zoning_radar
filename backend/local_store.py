@@ -9,7 +9,10 @@ Also holds `job_store`, tracking background ingestion jobs so the SSE
 status endpoint (GET /api/v1/ingest/status/{job_id}) can report live
 progress on a PDF that may take several minutes to OCR/extract. Same
 process-local caveat applies — a job's state disappears if the server
-restarts mid-run."""
+restarts mid-run.
+
+Also holds the scraped-URL dedup set used by services/scraper.py so a
+scraper run never re-downloads or re-queues a PDF it's already handled."""
 
 from typing import Any, Literal
 
@@ -99,3 +102,19 @@ def is_cancelled(job_id: str) -> bool:
 
 def get_job(job_id: str) -> dict[str, Any] | None:
     return job_store.get(job_id)
+
+
+# Every agenda/packet PDF URL the scraper has already downloaded and
+# queued for ingestion, regardless of whether that ingestion job later
+# succeeded, failed, or was cancelled — dedup is by "have we fetched this
+# URL before", not by ingestion outcome, so a scraper run never hammers
+# the same source URL repeatedly.
+_scraped_urls: set[str] = set()
+
+
+def is_scraped_url(url: str) -> bool:
+    return url in _scraped_urls
+
+
+def mark_scraped_url(url: str) -> None:
+    _scraped_urls.add(url)

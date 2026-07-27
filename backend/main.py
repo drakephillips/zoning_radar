@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import ingest, leads, parcels
+from routers import ingest, leads, parcels, scraper
 
 app = FastAPI(
     title="Zoning Radar API",
@@ -24,7 +24,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    # Next.js falls back to 3001+ when 3000 is already taken by another
+    # local process, so pin this to any localhost port rather than a single
+    # hardcoded one — avoids NetworkError on the frontend whenever that
+    # happens during local dev.
+    allow_origin_regex=r"http://localhost:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,6 +37,7 @@ app.add_middleware(
 app.include_router(ingest.router)
 app.include_router(parcels.router)
 app.include_router(leads.router)
+app.include_router(scraper.router)
 
 
 @app.get("/health")
