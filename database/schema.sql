@@ -5,8 +5,10 @@
 create extension if not exists postgis;
 create extension if not exists "uuid-ossp";
 
--- Signal strength used to rank rezoning_leads for off-market development potential
-create type signal_strength as enum ('HIGH', 'MED', 'LOW');
+-- Signal strength used to rank rezoning_leads for off-market development potential.
+-- EXCLUDED marks a parcel disqualified by nearby exclusion language (denied,
+-- historic resource, etc.) rather than a live lead.
+create type signal_strength as enum ('HIGH', 'MED', 'LOW', 'EXCLUDED');
 create type document_processed_status as enum ('PENDING', 'PROCESSING', 'PROCESSED', 'FAILED');
 create type document_type as enum (
   'CITY_COUNCIL_AGENDA',

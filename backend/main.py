@@ -1,8 +1,15 @@
 """FastAPI entry point for the Municipal & Zoning Intelligence Engine."""
 
+import logging
+
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Without this, module loggers (e.g. services.pdf_parser) have no handler
+# attached anywhere in the hierarchy, so Gemini extraction failures on large
+# PDFs were being logged but never actually printed anywhere visible.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

@@ -1,10 +1,14 @@
 """GET /api/v1/leads — rezoning leads joined with parcel + source document."""
 
-from fastapi import APIRouter, Depends, Query
-from supabase import Client
+import logging
 
-from db import get_supabase
+from fastapi import APIRouter, Query
+
+import local_store
+from db import SUPABASE_UNAVAILABLE_ERRORS, get_supabase, is_dev_mode
 from models.schemas import RezoningLeadDetail, SignalStrength
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/leads", tags=["leads"])
 
@@ -14,18 +18,31 @@ _SELECT = "*, parcel:parcels(*), document:documents(file_url)"
 @router.get("", response_model=list[RezoningLeadDetail])
 async def list_leads(
     signal_strength: SignalStrength | None = Query(default=None),
-    supabase: Client = Depends(get_supabase),
 ) -> list[RezoningLeadDetail]:
-    query = supabase.table("rezoning_leads").select(_SELECT)
-    if signal_strength:
-        query = query.eq("signal_strength", signal_strength.value)
+    if is_dev_mode():
+        # Known placeholder config (e.g. SUPABASE_SERVICE_ROLE_KEY unset) —
+        # get_supabase() would fail client construction itself here, so
+        # skip straight to the in-memory fallback rather than attempting it.
+        return local_store.list_leads(signal_strength=signal_strength)
 
-    rows = query.order("created_at", desc=True).execute().data
+    try:
+        query = get_supabase().table("rezoning_leads").select(_SELECT)
+        if signal_strength:
+            query = query.eq("signal_strength", signal_strength.value)
 
-    return [
-        RezoningLeadDetail(
-            **{k: v for k, v in row.items() if k != "document"},
-            agenda_source_url=row["document"]["file_url"],
+        rows = query.order("created_at", desc=True).execute().data
+
+        return [
+            RezoningLeadDetail(
+                **{k: v for k, v in row.items() if k != "document"},
+                agenda_source_url=row["document"]["file_url"],
+            )
+            for row in rows
+        ]
+    except SUPABASE_UNAVAILABLE_ERRORS as exc:
+        logger.warning(
+            "Supabase unreachable (%s: %s) — serving leads from the in-memory fallback store",
+            type(exc).__name__,
+            exc,
         )
-        for row in rows
-    ]
+        return local_store.list_leads(signal_strength=signal_strength)
