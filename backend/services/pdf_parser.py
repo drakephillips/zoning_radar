@@ -19,14 +19,16 @@ import io
 import logging
 import os
 import re
+import time
+from datetime import date
 from typing import BinaryIO, Callable, Literal
 
 import pdfplumber
 import pytesseract
 from pdf2image import convert_from_bytes
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from models.schemas import DocumentClassification, ExtractedParcelSignal, SignalStrength
+from models.schemas import DocumentClassification, ExtractedParcelSignal, LeadType, SignalStrength
 
 logger = logging.getLogger(__name__)
 
@@ -854,6 +856,16 @@ def _extract_via_regex(
 # deprecation cycle.
 GEMINI_MODEL = "gemini-flash-latest"
 
+# Native retry for a transient Gemini 503 (the model reporting temporary
+# "high demand" — confirmed live, and confirmed to still reach this code
+# even after google-genai's own internal retry already gave up). Deliberately
+# plain time.sleep()-based rather than pulling in tenacity or another
+# dependency for just this one case. Backoff is 2s, 4s, 8s between the 4
+# attempts; the 4th attempt's own failure is never slept on, since there's
+# no further attempt left to wait for.
+_GEMINI_503_MAX_ATTEMPTS = 4
+_GEMINI_503_BACKOFF_BASE_SECONDS = 2
+
 # Two-stage reasoning: a dedicated Stage 1 call classifies intent from just
 # the absolute front matter (the Staff Report / Executive Summary, typically
 # pages 1-10) with nothing else to distract it, before Stage 2 ever touches
@@ -886,29 +898,64 @@ _GEMINI_SIGNAL_TO_SIGNAL_STRENGTH: dict[str, SignalStrength] = {
     "LOW": SignalStrength.LOW,
 }
 
-_GEMINI_EXTRACTION_RULES = f"""Ignore, and never report as a lead:
+_GEMINI_EXTRACTION_RULES = f"""Look for TWO distinct kinds of lead, and set `lead_type` accordingly
+for every lead you report:
+
+- SITE_SPECIFIC: an entitlement tied to one specific parcel — a rezone, permit, variance, density
+  bonus, or similar action for a named property or APN.
+- POLICY_AMENDMENT: a citywide or district-wide zoning change with no single subject parcel —
+  a General Plan update, a Title XX/zoning code text amendment, an SB 79 transit-oriented overlay,
+  or the creation of new zoning districts (e.g. "this ordinance establishes four new high-density
+  zoning districts consistent with General Plan 2040"). These are just as important to report as
+  a SITE_SPECIFIC lead — do not skip a real policy change just because it has no APN attached.
+
+Ignore, and never report as a lead of either type:
 - City Hall's own address (e.g. "1017 Middlefield Rd") — it is never a subject parcel.
 - Applicant/consultant/law-firm office addresses found in letterheads or footers.
 - Procedural boilerplate (roll call, minutes approval, adjournment, pledge of allegiance).
 - Public notice radius lists — addresses of neighboring parcels notified of a hearing, not the
   parcel actually under consideration.
 
-For each real lead found:
-- Use the parcel's Assessor Parcel Number (APN) as the identifier if printed in the format
-  XXX-XXX-XXX. If no APN is printed but a street address is, set apn to "ADDR: <address>"
-  instead (e.g. "ADDR: 333 Main St").
+For a SITE_SPECIFIC lead:
+- Use the parcel's Assessor Parcel Number (APN) as the identifier, but only if it is printed in
+  a strictly numeric format like "XXX-XXX-XXX" or "XXX-XXXX-XXX". Never guess or infer the APN.
+  Never put an address in the apn field — the `address` field is always where the street address
+  belongs, regardless of whether an APN is present. If the exact APN is not explicitly stated in
+  this text, you must return null for apn.
+- Leave affected_districts null — that field is only for POLICY_AMENDMENT leads.
+
+For a POLICY_AMENDMENT lead:
+- Set apn and address to null — a macro policy change has no single parcel to attach either to.
+- Populate affected_districts with the district(s), plan area(s), or scope named in the text
+  (e.g. ["Downtown Precise Plan Area"], ["R-3 Zoning District"], or ["Citywide"] if the change
+  applies city-wide with no named sub-area).
+- Put a concise summary of the policy's actual impact (what changes, and for whom) in `reasoning`
+  — this is what a reader sees in place of a parcel address, so make it stand on its own.
+
+For every lead, of either type:
 - Extract from_zoning/to_zoning if a zoning change is described, whether as a code (e.g. "R-1")
-  or a descriptive name (e.g. "Low-Density Residential").
-- Extract unit_count if a specific number of housing units is mentioned for that parcel.
-- Extract entitlement_type (e.g. "Density Bonus", "Vesting Tentative Map", "Rezone").
-- Set signal to EXCLUDED if the parcel is described as denied, withdrawn, historic, ineligible,
-  or otherwise excluded from an entitlement/rezoning program rather than an active lead.
-  Otherwise use HIGH for rezone/General Plan Amendment-level changes, MEDIUM for density
-  bonus/specific plan/permit items, LOW for minor entitlements (variances, standard CUPs).
+  or a descriptive name (e.g. "Low-Density Residential"). For a POLICY_AMENDMENT establishing new
+  districts, use these for the new district code/name(s) where applicable.
+- Extract unit_count if a specific number of housing units is mentioned.
+- Extract entitlement_type (e.g. "Density Bonus", "Vesting Tentative Map", "Rezone", "Zoning Text
+  Amendment").
+- Extract meeting_date: the date of the city council or planning commission meeting this agenda
+  is for, as printed near the top of the agenda packet (e.g. a header like "Regular Meeting —
+  July 14, 2026" or "Meeting Date: 07/14/2026"). You MUST format it as a strict "YYYY-MM-DD"
+  string (e.g. "2026-07-14") — never a partial date, a relative phrase ("next Tuesday"), a
+  month/year only, or any other format. This is the same meeting date for every lead in the
+  document — look at the document's own front matter, not language describing when the parcel's
+  project itself was proposed or approved. If no meeting date is printed anywhere you've been
+  shown, or you cannot express it in exactly this format, return null — never guess and never
+  return a non-"YYYY-MM-DD" value.
+- Set signal to EXCLUDED if the item is described as denied, withdrawn, historic, ineligible, or
+  otherwise excluded from an entitlement/rezoning program rather than an active lead. Otherwise
+  use HIGH for rezone/General Plan Amendment-level changes and any POLICY_AMENDMENT, MEDIUM for
+  density bonus/specific plan/permit items, LOW for minor entitlements (variances, standard CUPs).
 - Provide a one-sentence `reasoning` explaining why this is (or isn't) a live lead.
 
 Report at most {MAX_LEADS_PER_CALL} leads — the most significant/active ones if there are more.
-Only report leads actually described in this text — never invent a parcel."""
+Only report leads actually described in this text — never invent a parcel or a policy change."""
 
 # ---------------------------------------------------------------------------
 # Stage 1: Intent Isolation. A dedicated, classification-only call over just
@@ -1002,8 +1049,11 @@ def _build_extraction_prompt(doc_type: DocumentClassification, executive_summary
         )
     else:
         intent_instruction = (
-            "The document intent is locked as a macro policy. Scan the chunks for actively "
-            "affected parcels and ignore exempted/historic properties."
+            "The document intent is locked as a macro policy. Report the policy change(s) "
+            "themselves as POLICY_AMENDMENT leads (see below) — do not skip these just because "
+            "they lack an APN. Separately, scan the chunks for any actively affected individual "
+            "parcels (e.g. an attached exhibit table) and report those as SITE_SPECIFIC leads, "
+            "ignoring exempted/historic properties."
         )
 
     return f"""You are a municipal zoning analyst reviewing one excerpt (a range of consecutive \
@@ -1019,15 +1069,90 @@ assume content from other parts of the document you have not been shown.
 {_GEMINI_EXTRACTION_RULES}"""
 
 
+# Enforces the "YYYY-MM-DD" format required of _GeminiLeadItem.meeting_date
+# (see its field validator below) — a strict 4-2-2 digit shape, not just
+# "contains a date somewhere," since rezoning_leads.meeting_date is a real
+# Postgres `date` column that would reject anything looser.
+_STRICT_ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 class _GeminiLeadItem(BaseModel):
+    lead_type: Literal["SITE_SPECIFIC", "POLICY_AMENDMENT"]
     address: str | None = None
-    apn: str | None = None
+    apn: str | None = Field(
+        default=None,
+        description=(
+            "The Assessor's Parcel Number (APN). Must strictly follow numeric formats like "
+            "'XXX-XXX-XXX' or 'XXX-XXXX-XXX'. Do NOT substitute an address. If a valid numeric "
+            "APN is not explicitly stated in the document, you must return null. Always null "
+            "for a POLICY_AMENDMENT lead — a macro policy change has no single parcel."
+        ),
+    )
+    # Only ever populated for a POLICY_AMENDMENT lead — the district(s),
+    # plan area(s), or scope of a macro zoning change (e.g. ["Downtown
+    # Precise Plan Area"] or ["Citywide"]). Always null for SITE_SPECIFIC.
+    affected_districts: list[str] | None = Field(
+        default=None,
+        description=(
+            "For a POLICY_AMENDMENT lead only: the district(s), plan area(s), or scope this "
+            "policy change affects (e.g. ['Downtown Precise Plan Area'], or ['Citywide'] if it "
+            "applies city-wide with no named sub-area). Always null for a SITE_SPECIFIC lead."
+        ),
+    )
     from_zoning: str | None = None
     to_zoning: str | None = None
     unit_count: int | None = None
     entitlement_type: str | None = None
+    meeting_date: str | None = Field(
+        default=None,
+        description=(
+            "The exact date of the city council or planning commission meeting found on the "
+            "agenda document. You MUST format this as a strict 'YYYY-MM-DD' string (e.g. "
+            "'2026-07-14') — never a partial date, a relative phrase, or any other date format. "
+            "If the exact date is not found, or cannot be expressed in exactly this format, you "
+            "must return null."
+        ),
+    )
     signal: Literal["HIGH", "MEDIUM", "EXCLUDED", "LOW"]
     reasoning: str
+
+    @field_validator("apn", mode="before")
+    @classmethod
+    def _reject_non_numeric_apn(cls, value: str | None) -> str | None:
+        """Belt-and-suspenders alongside the field description and prompt
+        constraints above: Gemini has been observed hallucinating an
+        address into this field (e.g. "ADDR: 320 Sheridan Dr.") when no
+        real APN is printed, despite being told not to. A real APN is
+        digits/hyphens only, so anything containing a letter gets nulled
+        out here rather than trusting the model's own restraint."""
+        if value is None:
+            return None
+        if any(char.isalpha() for char in value):
+            return None
+        return value
+
+    @field_validator("meeting_date", mode="before")
+    @classmethod
+    def _reject_malformed_meeting_date(cls, value: str | None) -> str | None:
+        """Belt-and-suspenders alongside the field description and prompt
+        constraints above: despite being told the exact required format,
+        Gemini can still return a relative phrase, a partial date, or some
+        other non-"YYYY-MM-DD" string. rezoning_leads.meeting_date is a
+        strict Postgres `date` column (see database/schema.sql), so a
+        malformed value reaching the database would raise a casting error
+        — nulling it out here instead means the ingest persistence layer
+        can always fall back to the parent document's meeting_date (see
+        routers/ingest.py's _persist_to_supabase) rather than ever passing
+        something uncastable through."""
+        if value is None:
+            return None
+        if not _STRICT_ISO_DATE_PATTERN.match(value):
+            return None
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            return None
+        return value
 
 
 class _GeminiChunkResult(BaseModel):
@@ -1081,10 +1206,16 @@ def _chunk_pages(
 def _call_gemini(
     client, contents: str, system_prompt: str, response_schema: type[BaseModel]
 ):
-    """Runs one Gemini structured-extraction call. Logs the specific API
-    error or JSON-parse failure (including a snippet of the raw response
-    and the finish_reason) instead of letting a large-document failure
-    surface as an opaque, unexplained fallback to the regex pipeline."""
+    """Runs one Gemini structured-extraction call, retrying a transient 503
+    (the model reporting temporary high demand — see
+    _GEMINI_503_MAX_ATTEMPTS) with a native exponential backoff before
+    giving up. Logs the specific API error or JSON-parse failure (including
+    a snippet of the raw response and the finish_reason) instead of letting
+    a large-document failure surface as an opaque, unexplained fallback to
+    the regex pipeline — a 503 that exhausts every retry, any other
+    APIError, or a parse failure all still re-raise exactly as before, so
+    extract_signals_from_pdf's outer try/except can fall back to the regex
+    pipeline unchanged."""
     from google.genai import errors, types
 
     if not contents.strip():
@@ -1093,26 +1224,54 @@ def _call_gemini(
             "document text to read and will very likely reject or hallucinate a response."
         )
 
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                response_schema=response_schema,
-                max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-            ),
-        )
-    except errors.APIError as exc:
-        logger.error(
-            "Gemini API call failed (%s, %d chars of input): %s: %s",
-            getattr(exc, "code", "unknown status"),
-            len(contents),
-            type(exc).__name__,
-            exc,
-        )
-        raise
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        response_mime_type="application/json",
+        response_schema=response_schema,
+        max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+    )
+
+    response = None
+    for attempt in range(1, _GEMINI_503_MAX_ATTEMPTS + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL, contents=contents, config=config
+            )
+            break
+        except errors.ServerError as exc:
+            # ServerError covers the whole 5xx range — only a 503 (high
+            # demand) is treated as transient/retryable here; any other
+            # server error falls straight through to the logging+raise
+            # below, same as before this retry loop existed.
+            is_503 = getattr(exc, "code", None) == 503
+            if not is_503 or attempt == _GEMINI_503_MAX_ATTEMPTS:
+                logger.error(
+                    "Gemini API call failed (%s, %d chars of input): %s: %s",
+                    getattr(exc, "code", "unknown status"),
+                    len(contents),
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
+            delay_seconds = _GEMINI_503_BACKOFF_BASE_SECONDS**attempt
+            logger.warning(
+                "Gemini returned 503 (high demand) on attempt %d/%d (%d chars of input) — "
+                "retrying in %ds.",
+                attempt,
+                _GEMINI_503_MAX_ATTEMPTS,
+                len(contents),
+                delay_seconds,
+            )
+            time.sleep(delay_seconds)
+        except errors.APIError as exc:
+            logger.error(
+                "Gemini API call failed (%s, %d chars of input): %s: %s",
+                getattr(exc, "code", "unknown status"),
+                len(contents),
+                type(exc).__name__,
+                exc,
+            )
+            raise
 
     finish_reason = response.candidates[0].finish_reason if response.candidates else None
     if finish_reason is not None and finish_reason != types.FinishReason.STOP:
@@ -1225,6 +1384,9 @@ def _extract_via_gemini(
             city=city_name,
             unit_count=item.unit_count,
             entitlement_type=item.entitlement_type,
+            meeting_date=item.meeting_date,
+            lead_type=LeadType(item.lead_type),
+            affected_districts=item.affected_districts,
         )
         for item in lead_items
     ]

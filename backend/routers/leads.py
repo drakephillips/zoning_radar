@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/leads", tags=["leads"])
 
-_SELECT = "*, parcel:parcels(*), document:documents(file_url)"
+_SELECT = "*, parcel:parcels(*), document:documents(file_url, city_name)"
 
 
 @router.get("", response_model=list[RezoningLeadDetail])
@@ -36,6 +36,13 @@ async def list_leads(
             RezoningLeadDetail(
                 **{k: v for k, v in row.items() if k != "document"},
                 agenda_source_url=row["document"]["file_url"],
+                # documents.city_name is NOT NULL, so this is always a real
+                # value for every lead regardless of lead_type — unlike
+                # parcel.city, which is null for a POLICY_AMENDMENT lead
+                # (no single parcel). The frontend's Jurisdiction column
+                # reads this field directly rather than falling back to
+                # parcel.city, so both lead types map correctly.
+                jurisdiction=row["document"]["city_name"],
             )
             for row in rows
         ]
