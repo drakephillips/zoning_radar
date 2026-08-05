@@ -71,7 +71,9 @@ live before depending on it in production.
 
 import abc
 import logging
+import os
 import re
+import tempfile
 from datetime import datetime, timedelta
 from urllib.parse import parse_qs, quote, unquote, urlparse, urlsplit, urlunsplit
 
@@ -1520,7 +1522,24 @@ async def find_new_documents(
     return new_documents
 
 
-async def download_document(url: str, client: AsyncSession) -> bytes:
-    response = await client.get(url)
+async def download_document(url: str, client: AsyncSession) -> str:
+    """Streams the PDF to a temp file on disk instead of buffering the
+    whole response in memory — some agenda packets run 40+ MB (confirmed
+    live against a real Menlo Park Planning Commission packet), and
+    holding that fully in RAM for every concurrent ingest job doesn't
+    scale. Returns the temp file's path; the caller owns deleting it once
+    done (see routers/ingest.py's _run_ingest_job, the single place every
+    caller — the scraper router, cron_scrape.py, and the manual upload
+    endpoint — routes through)."""
+    response = await client.get(url, stream=True)
     response.raise_for_status()
-    return response.content
+
+    fd, path = tempfile.mkstemp(suffix=".pdf")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            async for chunk in response.aiter_content():
+                f.write(chunk)
+    except Exception:
+        os.unlink(path)
+        raise
+    return path

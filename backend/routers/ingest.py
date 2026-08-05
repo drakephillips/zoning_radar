@@ -2,9 +2,10 @@
 background job; GET /api/v1/ingest/status/{job_id} streams its progress."""
 
 import asyncio
-import io
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -32,6 +33,26 @@ router = APIRouter(prefix="/api/v1/ingest", tags=["ingest"])
 
 # How often the SSE endpoint polls job_store for an update.
 STATUS_POLL_INTERVAL_SECONDS = 1
+
+UPLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
+
+
+async def _save_upload_to_tempfile(file: UploadFile) -> str:
+    """Streams a manually-uploaded PDF to our own temp file in fixed-size
+    chunks, mirroring services/scraper.py's download_document — never
+    buffers the whole upload in memory at once. Written to a file we own
+    (rather than trusting UploadFile's own internal temp file) because
+    that one isn't guaranteed to survive past this request once
+    BackgroundTasks actually runs the job later."""
+    fd, path = tempfile.mkstemp(suffix=".pdf")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            while chunk := await file.read(UPLOAD_CHUNK_SIZE_BYTES):
+                f.write(chunk)
+    except Exception:
+        os.unlink(path)
+        raise
+    return path
 
 
 def _build_fallback_parcel(signal: ExtractedParcelSignal, city_name: str) -> Parcel | None:
@@ -267,7 +288,7 @@ def _persist_to_supabase(
 
 def _run_ingest_job(
     job_id: str,
-    file_bytes: bytes,
+    pdf_path: str,
     file_url: str,
     city_name: str,
     document_type: DocumentType,
@@ -282,7 +303,12 @@ def _run_ingest_job(
     constraint (see database/schema.sql). For a manual upload that's the
     uploaded filename; for a scraped document it must be the real,
     distinct pdf_url, never a generic display title that different
-    documents could share (see routers/scraper.py's call site)."""
+    documents could share (see routers/scraper.py's call site).
+
+    pdf_path is a temp file on disk (see services/scraper.py's
+    download_document and _save_upload_to_tempfile below) — this function
+    owns its lifecycle and always deletes it before returning, success or
+    failure, so temp files never accumulate across runs."""
 
     def progress_callback(message: str) -> None:
         local_store.update_job_progress(job_id, message)
@@ -292,7 +318,7 @@ def _run_ingest_job(
 
     try:
         signals, doc_type, excluded_count = extract_signals_from_pdf(
-            io.BytesIO(file_bytes),
+            pdf_path,
             city_name=city_name,
             progress_callback=progress_callback,
             should_cancel=should_cancel,
@@ -344,6 +370,13 @@ def _run_ingest_job(
     except Exception as exc:
         logger.exception("Ingest job %s failed", job_id)
         local_store.fail_job(job_id, str(exc))
+    finally:
+        # Always runs — success, cancellation, or failure — so a temp PDF
+        # never outlives the job that downloaded/uploaded it.
+        try:
+            os.unlink(pdf_path)
+        except OSError:
+            logger.warning("Failed to delete temp PDF %s", pdf_path, exc_info=True)
 
 
 @router.post("", response_model=IngestJobCreated, status_code=202)
@@ -356,17 +389,18 @@ async def ingest_document(
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=400, detail="Only application/pdf uploads are supported")
 
-    # Read the upload into memory now, synchronously, before returning —
+    # Streamed to our own temp file now, synchronously, before returning —
     # UploadFile's underlying temp file isn't guaranteed to survive past
-    # this request once BackgroundTasks runs, so the background job gets
-    # plain bytes instead of the UploadFile itself.
-    file_bytes = await file.read()
+    # this request once BackgroundTasks runs, so the background job gets a
+    # path to a file we own instead of the UploadFile itself. _run_ingest_job
+    # deletes it when done, same as a scraper-downloaded PDF.
+    file_path = await _save_upload_to_tempfile(file)
 
     job_id = str(uuid4())
     local_store.create_job(job_id, message="Queued")
 
     background_tasks.add_task(
-        _run_ingest_job, job_id, file_bytes, file.filename or "upload.pdf", city_name, document_type
+        _run_ingest_job, job_id, file_path, file.filename or "upload.pdf", city_name, document_type
     )
 
     return IngestJobCreated(job_id=job_id)

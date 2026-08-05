@@ -123,7 +123,7 @@ async def run_scraper(
                 break
 
             try:
-                file_bytes = await download_document(document.pdf_url, client)
+                file_path = await download_document(document.pdf_url, client)
             except RequestException:
                 logger.exception("Failed to download scraped document %s", document.pdf_url)
                 continue
@@ -144,7 +144,7 @@ async def run_scraper(
             background_tasks.add_task(
                 _run_ingest_job,
                 job_id,
-                file_bytes,
+                file_path,
                 # The real, distinct PDF URL — not `title`, which is often
                 # a generic label ("Agenda packet(PDF, 153KB)") shared by
                 # many unrelated documents across different meetings.

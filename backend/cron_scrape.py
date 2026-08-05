@@ -32,10 +32,32 @@ from services.scraper_utils import get_default_headers
 
 DOWNLOAD_TIMEOUT_SECONDS = 60.0
 
+# TEMPORARY DEBUG FILTER — set back to None before committing/pushing to
+# Render. Restricts a local test run to just these cities (matched against
+# MunicipalSource.city) instead of sweeping every configured jurisdiction,
+# so testing the new validation rules doesn't burn Gemini tokens scraping
+# sources you don't need for the test. None (the normal/production value)
+# means "no filter — scrape every configured source."
+DEBUG_CITY_FILTER: list[str] | None = None
+
 
 async def run() -> None:
-    documents = await find_new_documents(SOURCES)
-    logger.info("Found %d new document(s) across %d source(s)", len(documents), len(SOURCES))
+    sources = (
+        SOURCES
+        if DEBUG_CITY_FILTER is None
+        else [s for s in SOURCES if s.city in DEBUG_CITY_FILTER]
+    )
+    if DEBUG_CITY_FILTER is not None:
+        logger.warning(
+            "DEBUG_CITY_FILTER is active — only scraping %s (%d of %d configured sources). "
+            "Set DEBUG_CITY_FILTER = None before deploying.",
+            DEBUG_CITY_FILTER,
+            len(sources),
+            len(SOURCES),
+        )
+
+    documents = await find_new_documents(sources)
+    logger.info("Found %d new document(s) across %d source(s)", len(documents), len(sources))
 
     downloaded_count = 0
     async with AsyncSession(
@@ -54,7 +76,7 @@ async def run() -> None:
                 break
 
             try:
-                file_bytes = await download_document(document.pdf_url, client)
+                file_path = await download_document(document.pdf_url, client)
             except RequestException:
                 logger.exception("Failed to download %s", document.pdf_url)
                 continue
@@ -72,7 +94,7 @@ async def run() -> None:
             # invocation can just run this synchronously and exit when done.
             _run_ingest_job(
                 job_id,
-                file_bytes,
+                file_path,
                 document.pdf_url,
                 document.jurisdiction,
                 DocumentType.CITY_COUNCIL_AGENDA,

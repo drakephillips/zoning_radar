@@ -15,17 +15,16 @@ two system binaries beyond the pip packages: the `tesseract` OCR engine and
 tesseract poppler` on macOS, `apt-get install tesseract-ocr poppler-utils`
 on Debian/Ubuntu."""
 
-import io
 import logging
 import os
 import re
 import time
 from datetime import date
-from typing import BinaryIO, Callable, Literal
+from typing import Callable, Literal
 
 import pdfplumber
 import pytesseract
-from pdf2image import convert_from_bytes
+from pdf2image import convert_from_path
 from pydantic import BaseModel, Field, field_validator
 
 from models.schemas import DocumentClassification, ExtractedParcelSignal, LeadType, SignalStrength
@@ -699,13 +698,15 @@ def _dedupe_by_apn(signals: list[ExtractedParcelSignal]) -> list[ExtractedParcel
     return [*best_by_apn.values(), *unresolved]
 
 
-def _ocr_page(pdf_bytes: bytes, page_number: int) -> str:
+def _ocr_page(pdf_path: str, page_number: int) -> str:
     """OCR fallback for a page pdfplumber couldn't extract text from —
     typically a scanned/image-only page with no text layer at all. Renders
-    just that one page to an image (via poppler) and runs Tesseract over
-    it, rather than re-rendering the whole document for every blank page."""
+    just that one page to an image (via poppler, reading directly from
+    disk rather than needing the whole PDF's bytes in memory) and runs
+    Tesseract over it, rather than re-rendering the whole document for
+    every blank page."""
     try:
-        images = convert_from_bytes(pdf_bytes, first_page=page_number, last_page=page_number)
+        images = convert_from_path(pdf_path, first_page=page_number, last_page=page_number)
     except Exception:
         logger.exception(
             "OCR page rendering failed for page %d (is poppler installed? "
@@ -729,11 +730,13 @@ def _ocr_page(pdf_bytes: bytes, page_number: int) -> str:
 
 
 def _extract_pdf_text(
-    file: BinaryIO,
+    pdf_path: str,
     progress_callback: ProgressCallback | None = None,
     should_cancel: CancelCheck | None = None,
 ) -> tuple[list[str], list[tuple[int, int]], str]:
-    """Extracts per-page text from a PDF. Returns (pages_text,
+    """Extracts per-page text from a PDF on disk — pdfplumber reads
+    `pdf_path` directly rather than needing the whole file's bytes loaded
+    into memory first, same as the OCR fallback below. Returns (pages_text,
     page_boundaries, full_text): `page_boundaries` pairs each page's start
     offset within `full_text` with its 1-based page number, mirroring how
     the pages were joined below.
@@ -741,14 +744,14 @@ def _extract_pdf_text(
     Falls back to OCR for any page with no extractable text layer (a
     scanned/image-only page), so the two-stage Gemini pipeline — and the
     regex fallback — always have real words to evaluate instead of silently
-    losing that page's content entirely."""
+    losing that page's content entirely. Only ever extracts text: images,
+    site plans, and other graphics on the page are never read or sent
+    anywhere — see extract_signals_from_pdf's docstring."""
     pages_text: list[str] = []
     page_boundaries: list[tuple[int, int]] = []
     offset = 0
 
-    pdf_bytes = file.read()
-
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+    with pdfplumber.open(pdf_path) as pdf:
         total_pages = len(pdf.pages)
         for page_number, page in enumerate(pdf.pages, start=1):
             _check_cancelled(should_cancel)
@@ -762,7 +765,7 @@ def _extract_pdf_text(
                 _report_progress(
                     progress_callback, f"Running OCR: Page {page_number} of {total_pages}"
                 )
-                text = _ocr_page(pdf_bytes, page_number)
+                text = _ocr_page(pdf_path, page_number)
                 if not text.strip():
                     logger.warning(
                         "OCR also produced no text for page %d — skipping this page.",
@@ -1451,16 +1454,25 @@ def _extract_via_gemini(
 
 
 def extract_signals_from_pdf(
-    file: BinaryIO,
+    pdf_path: str,
     city_name: str | None = None,
     progress_callback: ProgressCallback | None = None,
     should_cancel: CancelCheck | None = None,
 ) -> tuple[list[ExtractedParcelSignal], DocumentClassification, int]:
-    """Runs the full scan pipeline over a municipal PDF's pages, returning
-    the deduped signals, a document-level classification, and a count of
-    EXCLUDED signals suppressed from that list. Uses Gemini when
-    GEMINI_API_KEY is configured, falling back to the regex/heuristic
-    pipeline if the key is missing or the Gemini call fails.
+    """Runs the full scan pipeline over a municipal PDF on disk (`pdf_path`
+    — the caller owns that file's lifecycle, see routers/ingest.py's
+    _run_ingest_job), returning the deduped signals, a document-level
+    classification, and a count of EXCLUDED signals suppressed from that
+    list. Uses Gemini when GEMINI_API_KEY is configured, falling back to
+    the regex/heuristic pipeline if the key is missing or the Gemini call
+    fails.
+
+    Only ever sends extracted plain text to Gemini, never the PDF file
+    itself or any image/graphic from it: _extract_pdf_text below reads the
+    file once, up front, via pdfplumber (OCR for any page with no text
+    layer), and every Gemini call after that — see _call_gemini — takes a
+    plain Python string as its payload.
+
     `progress_callback`, if given, is called with human-readable status
     strings ("Running OCR: Page 3 of 40", "Stage 1: Checking intent...")
     for a caller to surface live (e.g. the SSE job endpoint). `should_cancel`,
@@ -1470,7 +1482,7 @@ def extract_signals_from_pdf(
     _check_cancelled(should_cancel)
     _report_progress(progress_callback, "Reading PDF pages...")
     pages_text, page_boundaries, full_text = _extract_pdf_text(
-        file, progress_callback, should_cancel
+        pdf_path, progress_callback, should_cancel
     )
 
     if is_gemini_configured():
