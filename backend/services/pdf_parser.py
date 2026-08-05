@@ -925,13 +925,28 @@ for every lead you report:
 
 - SITE_SPECIFIC: an entitlement tied to one specific parcel — a rezone, permit, variance, density
   bonus, or similar action for a named property or APN.
-- POLICY_AMENDMENT: a citywide or district-wide zoning change with no single subject parcel —
-  a General Plan update, a Title XX/zoning code text amendment, an SB 79 transit-oriented overlay,
-  or the creation of new zoning districts (e.g. "this ordinance establishes four new high-density
-  zoning districts consistent with General Plan 2040"). These are just as important to report as
-  a SITE_SPECIFIC lead — do not skip a real policy change just because it has no APN attached.
+- POLICY_AMENDMENT: a citywide or district-wide LAND USE change with no single subject parcel —
+  a General Plan update, a Title XX/zoning code text amendment, a Housing Element update, an SB 79
+  transit-oriented overlay, a building/construction code amendment, or the creation of new zoning
+  districts (e.g. "this ordinance establishes four new high-density zoning districts consistent
+  with General Plan 2040"). These are just as important to report as a SITE_SPECIFIC lead — do
+  not skip a real land-use policy change just because it has no APN attached.
+
+  This tool tracks real estate development signals, not general civic administration. ONLY
+  report a POLICY_AMENDMENT if it strictly concerns land use, zoning, housing elements,
+  building/construction codes, or real estate development. Before reporting one, ask: does this
+  change what can be built, where, or how much? If the answer is no, it is NEVER a lead — no
+  matter how "citywide" or officially it's described, and regardless of how much agenda
+  discussion time it received.
 
 Ignore, and never report as a lead of either type:
+- Civic, administrative, recreational, or other non-land-use municipal policies — e.g. a park
+  bench dedication program, a dog park or off-leash area rules update, a noise ordinance
+  unrelated to land use, a committee/commission merger or reorganization, a contract or vendor
+  award, a fee schedule update, a special event permit, or any other parks-and-recreation program
+  change. These are real municipal actions, but they are never real estate development leads —
+  do not report them as a POLICY_AMENDMENT (or any lead) regardless of how the agenda item is
+  titled.
 - City Hall's own address (e.g. "1017 Middlefield Rd") — it is never a subject parcel.
 - Applicant/consultant/law-firm office addresses found in letterheads or footers.
 - Procedural boilerplate (roll call, minutes approval, adjournment, pledge of allegiance).
