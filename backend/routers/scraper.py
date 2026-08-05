@@ -28,17 +28,20 @@ router = APIRouter(prefix="/api/v1/scraper", tags=["scraper"])
 
 DOWNLOAD_TIMEOUT_SECONDS = 60.0
 
-# Some listing pages (e.g. a CivicPlus AgendaCenter) return years of
-# historical packets rather than just recently-posted ones, so on a source's
-# very first run "new documents" can mean "the site's entire archive" across
-# every configured jurisdiction — without a cap, one click would download +
-# Gemini-extract all of them at once, burning through API credits in a
-# single sweep. This is a hard ceiling on total *downloaded* PDFs for the
-# whole run (summed across every source, not per-source), so it holds even
-# when a multi-city sweep would otherwise pull well past it. Anything past
-# the cap stays un-scraped (not marked as seen) and gets picked up on a
-# later run.
-MAX_TOTAL_DOCUMENTS_PER_SWEEP = 3
+# The actual defense against pulling old/historical agendas is
+# services/scraper.py's DEFAULT_LOOKBACK_DAYS (30 days) — every strategy's
+# _resolve_date_window applies that bound whether or not this is a source's
+# "first run", so find_new_documents already never returns anything older
+# than that regardless of this cap's value. This is a separate, secondary
+# ceiling: a hard cap on total *downloaded* PDFs for the whole run (summed
+# across every source, not per-source) purely as an API-cost circuit
+# breaker, in case an unusually large number of genuinely-recent documents
+# come back at once across every configured jurisdiction. Raised from 3 to
+# 50 so a full 21-source sweep isn't artificially truncated mid-run when
+# verifying coverage — anything past the cap (still only ever within the
+# lookback window) stays un-scraped (not marked as seen) and gets picked
+# up on a later run.
+MAX_TOTAL_DOCUMENTS_PER_SWEEP = 50
 
 
 class ScraperJobSummary(BaseModel):
