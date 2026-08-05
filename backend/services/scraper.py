@@ -83,6 +83,7 @@ from curl_cffi.requests.exceptions import HTTPError, RequestException
 from pydantic import BaseModel
 
 import local_store
+from mem_diagnostics import peak_rss_mb
 from config.sources import SOURCES as SOURCE_CONFIG
 from services.scraper_utils import (
     get_default_headers,
@@ -1542,4 +1543,10 @@ async def download_document(url: str, client: AsyncSession) -> str:
     except Exception:
         os.unlink(path)
         raise
+    logger.info(
+        "[mem] after download (%s, %d bytes): %.1f MB",
+        url,
+        os.path.getsize(path),
+        peak_rss_mb(),
+    )
     return path

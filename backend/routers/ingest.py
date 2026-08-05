@@ -13,6 +13,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 import local_store
+from mem_diagnostics import peak_rss_mb
 from db import SUPABASE_UNAVAILABLE_ERRORS, get_supabase, is_dev_mode
 from models.schemas import (
     DocumentClassification,
@@ -316,12 +317,18 @@ def _run_ingest_job(
     def should_cancel() -> bool:
         return local_store.is_cancelled(job_id)
 
+    logger.info("[mem] starting ingest job %s for %r: %.1f MB", job_id, file_url, peak_rss_mb())
     try:
         signals, doc_type, excluded_count = extract_signals_from_pdf(
             pdf_path,
             city_name=city_name,
             progress_callback=progress_callback,
             should_cancel=should_cancel,
+        )
+        logger.info(
+            "[mem] extract_signals_from_pdf returned (%d signals): %.1f MB",
+            len(signals),
+            peak_rss_mb(),
         )
 
         if not is_dev_mode():
@@ -331,6 +338,7 @@ def _run_ingest_job(
                 )
                 result = _log_and_annotate_zero_leads(result, city_name)
                 local_store.complete_job(job_id, result.model_dump(mode="json"))
+                logger.info("[mem] ingest job %s complete: %.1f MB", job_id, peak_rss_mb())
                 return
             except SUPABASE_UNAVAILABLE_ERRORS as exc:
                 logger.warning(

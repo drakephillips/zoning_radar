@@ -27,6 +27,7 @@ import fitz
 import pytesseract
 from pydantic import BaseModel, Field, field_validator
 
+from mem_diagnostics import peak_rss_mb
 from models.schemas import DocumentClassification, ExtractedParcelSignal, LeadType, SignalStrength
 
 logger = logging.getLogger(__name__)
@@ -727,6 +728,7 @@ def _ocr_page(doc: "fitz.Document", page_number: int) -> str:
     finally:
         del pix
         gc.collect()
+        logger.info("[mem] after OCR page %d: %.1f MB", page_number, peak_rss_mb())
 
 
 def _extract_pdf_text(
@@ -779,6 +781,12 @@ def _extract_pdf_text(
             offset += len(text) + 1  # +1 for the "\n" join below
 
     full_text = "\n".join(pages_text)
+    logger.info(
+        "[mem] after text extraction (%d pages, %d chars): %.1f MB",
+        len(pages_text),
+        len(full_text),
+        peak_rss_mb(),
+    )
     return pages_text, page_boundaries, full_text
 
 
@@ -1362,6 +1370,7 @@ def _extract_via_gemini(
     from google import genai
 
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    logger.info("[mem] entering _extract_via_gemini: %.1f MB", peak_rss_mb())
 
     # --- Stage 1: Intent Isolation ------------------------------------
     # Classification-only call over just the absolute front matter. Its
@@ -1375,6 +1384,7 @@ def _extract_via_gemini(
     intent = _classify_document_intent(client, intent_text)
     doc_type = intent.doc_type
     executive_summary = intent.executive_summary
+    logger.info("[mem] after Stage 1 (doc_type=%s): %.1f MB", doc_type, peak_rss_mb())
 
     # --- Stage 2: Anchored Extraction ---------------------------------
     # Every extraction call — the primary chunk and any supplementary
@@ -1389,10 +1399,16 @@ def _extract_via_gemini(
         client, front_matter_text, extraction_prompt, _GeminiChunkResult
     )
     lead_items = list(primary_result.leads)
+    logger.info("[mem] after Stage 2 primary chunk: %.1f MB", peak_rss_mb())
 
     if doc_type == "POLICY_ORDINANCE":
         chunks = _chunk_pages(
             pages_text, page_boundaries, front_matter_page_count, EXHIBIT_CHUNK_PAGE_COUNT
+        )
+        logger.info(
+            "[mem] before supplementary chunk loop (%d chunks): %.1f MB",
+            len(chunks),
+            peak_rss_mb(),
         )
         for i, chunk_text in enumerate(chunks, start=1):
             # Checked outside the try/except below so a cancellation
@@ -1415,6 +1431,9 @@ def _extract_via_gemini(
                     len(chunks),
                 )
                 continue
+            logger.info(
+                "[mem] after chunk %d/%d: %.1f MB", i, len(chunks), peak_rss_mb()
+            )
             lead_items.extend(chunk_result.leads)
 
     accepted_items: list[_GeminiLeadItem] = []
