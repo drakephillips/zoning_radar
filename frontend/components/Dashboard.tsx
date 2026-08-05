@@ -19,8 +19,11 @@ export default function Dashboard({ initialLeads, initialSources }: DashboardPro
   const [filters, setFilters] = useState<LeadFilters>(DEFAULT_FILTERS);
 
   const activeLeads = leads.filter((lead) => lead.signal_strength !== "EXCLUDED");
+  // Every parcel a lead is linked to carries the same signal-level unit
+  // count (see backend/routers/ingest.py), so summing per-lead via
+  // parcels[0] avoids double-counting a multi-parcel assemblage.
   const regionalPipeline = activeLeads.reduce(
-    (total, lead) => total + (lead.parcel?.max_units ?? 0),
+    (total, lead) => total + (lead.parcels[0]?.max_units ?? 0),
     0,
   );
   const highYieldSignals = leads.filter(

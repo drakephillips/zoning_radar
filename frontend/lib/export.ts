@@ -22,17 +22,25 @@ function escapeCsvField(value: string): string {
   return value;
 }
 
+// Site Address/APN/zoning columns join every parcel a lead is linked to
+// with "; " — unlike the dashboard table's truncated "+N more" display,
+// a CSV export shouldn't silently drop the 2nd/3rd parcel of a
+// multi-parcel assemblage.
 function leadToRow(lead: RezoningLeadDetail): string[] {
+  const primaryParcel = lead.parcels[0] ?? null;
   return [
     lead.meeting_date ?? "",
     lead.jurisdiction,
     lead.lead_type,
-    lead.parcel?.address ?? "",
-    lead.parcel?.apn ?? "",
+    lead.parcels.map((p) => p.address).join("; "),
+    lead.parcels.map((p) => p.apn).join("; "),
     lead.entitlement_type ?? "",
-    lead.parcel?.current_zoning ?? "",
-    lead.parcel?.proposed_zoning ?? "",
-    lead.parcel?.max_units != null ? String(lead.parcel.max_units) : "",
+    lead.parcels.map((p) => p.current_zoning ?? "").join("; "),
+    lead.parcels.map((p) => p.proposed_zoning ?? "").join("; "),
+    // Every parcel a lead is linked to carries the same signal-level unit
+    // count (see backend/routers/ingest.py) — the primary parcel's value
+    // is representative, not a sum (summing would double-count).
+    primaryParcel?.max_units != null ? String(primaryParcel.max_units) : "",
     lead.signal_strength,
   ];
 }

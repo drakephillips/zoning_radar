@@ -9,11 +9,12 @@ create extension if not exists "uuid-ossp";
 -- EXCLUDED marks a parcel disqualified by nearby exclusion language (denied,
 -- historic resource, etc.) rather than a live lead.
 create type signal_strength as enum ('HIGH', 'MED', 'LOW', 'EXCLUDED');
--- SITE_SPECIFIC: a rezone/permit/variance tied to one parcel (parcel_id set).
+-- SITE_SPECIFIC: a rezone/permit/variance tied to one or more parcels (see
+-- lead_parcels below — a development can span several adjacent lots).
 -- POLICY_AMENDMENT: a citywide/district-wide zoning code or General Plan
--- change with no single subject parcel (parcel_id null; affected_districts
--- describes the change's scope instead) — e.g. a Title 27 text amendment
--- establishing new zoning districts.
+-- change with no single subject parcel (no lead_parcels rows at all;
+-- affected_districts describes the change's scope instead) — e.g. a
+-- Title 27 text amendment establishing new zoning districts.
 create type lead_type as enum ('SITE_SPECIFIC', 'POLICY_AMENDMENT');
 create type document_processed_status as enum ('PENDING', 'PROCESSING', 'PROCESSED', 'FAILED');
 create type document_type as enum (
@@ -74,14 +75,12 @@ create index documents_processed_status_idx on documents (processed_status);
 create index documents_meeting_date_idx on documents (meeting_date);
 
 -- ---------------------------------------------------------------------------
--- rezoning_leads: extracted off-market development signals linking a parcel
--- to the source document it was found in
+-- rezoning_leads: extracted off-market development signals linking one or
+-- more parcels (see lead_parcels below) to the source document they were
+-- found in
 -- ---------------------------------------------------------------------------
 create table rezoning_leads (
   id uuid primary key default uuid_generate_v4(),
-  -- Nullable: null for a POLICY_AMENDMENT lead, which has no single subject
-  -- parcel to join against (see lead_type). Always set for SITE_SPECIFIC.
-  parcel_id uuid references parcels (id) on delete cascade,
   document_id uuid not null references documents (id) on delete cascade,
   lead_type lead_type not null default 'SITE_SPECIFIC',
   signal_strength signal_strength not null,
@@ -109,19 +108,25 @@ create table rezoning_leads (
   -- PDF (Page N)" deep link. Nullable since rows inserted before this
   -- column existed have no value for it — every new insert always sets it.
   page_number integer,
-  created_at timestamptz not null default now(),
-  -- Dedupes SITE_SPECIFIC leads for the same parcel+meeting: two documents
-  -- describing the same item (e.g. an Agenda PDF and a later Minutes PDF
-  -- for the same meeting, or a re-scrape under a slightly different URL)
-  -- upsert onto the same row instead of creating a duplicate (see
-  -- backend/routers/ingest.py's _persist_to_supabase, which upserts on
-  -- this exact pair). Postgres treats every NULL as distinct from every
-  -- other NULL, so this never restricts POLICY_AMENDMENT leads (parcel_id
-  -- is always null there — see lead_type) — only SITE_SPECIFIC leads,
-  -- which is exactly the case being deduped.
-  constraint rezoning_leads_parcel_meeting_date_key unique (parcel_id, meeting_date)
+  created_at timestamptz not null default now()
 );
 
-create index rezoning_leads_parcel_id_idx on rezoning_leads (parcel_id);
 create index rezoning_leads_document_id_idx on rezoning_leads (document_id);
 create index rezoning_leads_signal_strength_idx on rezoning_leads (signal_strength);
+
+-- ---------------------------------------------------------------------------
+-- lead_parcels: many-to-many junction between rezoning_leads and parcels —
+-- a SITE_SPECIFIC lead can span more than one parcel (an assemblage of
+-- adjacent lots, or a JIT address lookup matching several distinct APNs
+-- that share one situs address — see backend/services/parcel_resolver.py).
+-- A POLICY_AMENDMENT lead has no rows here at all (see lead_type).
+-- ---------------------------------------------------------------------------
+create table lead_parcels (
+  lead_id uuid not null references rezoning_leads (id) on delete cascade,
+  parcel_id uuid not null references parcels (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (lead_id, parcel_id)
+);
+
+create index lead_parcels_lead_id_idx on lead_parcels (lead_id);
+create index lead_parcels_parcel_id_idx on lead_parcels (parcel_id);

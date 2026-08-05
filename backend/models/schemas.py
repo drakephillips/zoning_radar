@@ -18,8 +18,9 @@ class SignalStrength(str, Enum):
 
 
 class LeadType(str, Enum):
-    # A single, specific parcel entitlement (rezone, permit, variance, ...)
-    # — carries an APN and/or address and joins to exactly one Parcel row.
+    # A specific parcel entitlement (rezone, permit, variance, ...) — joins
+    # to one or more Parcel rows via the lead_parcels junction table (a
+    # development can span an assemblage of adjacent lots).
     SITE_SPECIFIC = "SITE_SPECIFIC"
     # A citywide or district-wide zoning code/General Plan change with no
     # single subject parcel (e.g. a Title 27 text amendment establishing new
@@ -161,10 +162,6 @@ class Parcel(ParcelBase):
 # Rezoning leads (the alerts surfaced to the frontend dashboard)
 # ---------------------------------------------------------------------------
 class RezoningLeadBase(BaseModel):
-    # Null for a POLICY_AMENDMENT lead — a citywide/district-wide zoning
-    # change has no single subject parcel to join against. Always set for
-    # a SITE_SPECIFIC lead.
-    parcel_id: Optional[UUID] = None
     document_id: UUID
     lead_type: LeadType = LeadType.SITE_SPECIFIC
     signal_strength: SignalStrength
@@ -187,12 +184,16 @@ class RezoningLead(RezoningLeadBase):
 
 
 class RezoningLeadDetail(RezoningLead):
-    """Rezoning lead joined with its parcel for dashboard table display.
-    `parcel` is null for a POLICY_AMENDMENT lead (see LeadType) — there is
-    no single parcel to join against, so the frontend must render
-    `affected_districts` instead whenever `parcel` is absent."""
+    """Rezoning lead joined with the parcel(s) it's linked to (via the
+    lead_parcels junction table — see database/schema.sql) for dashboard
+    table display. A SITE_SPECIFIC lead can be linked to more than one
+    parcel (an assemblage of adjacent lots, or several APNs sharing one
+    situs address — see services/parcel_resolver.py); `parcels` is empty
+    for a POLICY_AMENDMENT lead (see LeadType) — there is no single parcel
+    to join against, so the frontend must render `affected_districts`
+    instead whenever `parcels` is empty."""
 
-    parcel: Optional[Parcel] = None
+    parcels: list[Parcel] = Field(default_factory=list)
     agenda_source_url: str
     # The source document's own city_name — always present (NOT NULL),
     # regardless of lead_type. Use this for a lead's Jurisdiction display

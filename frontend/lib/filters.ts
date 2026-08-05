@@ -69,9 +69,11 @@ export function applySort(
 ): RezoningLeadDetail[] {
   const sorted = [...leads];
   if (sortOrder === "yield") {
-    // A POLICY_AMENDMENT lead has no parcel/unit count, so it correctly
-    // sorts to the bottom here — it has no yield figure to rank by.
-    sorted.sort((a, b) => (b.parcel?.max_units ?? 0) - (a.parcel?.max_units ?? 0));
+    // A POLICY_AMENDMENT lead has no parcels/unit count, so it correctly
+    // sorts to the bottom here — it has no yield figure to rank by. Every
+    // parcel a lead is linked to carries the same signal-level unit count
+    // (see backend/routers/ingest.py), so parcels[0] is representative.
+    sorted.sort((a, b) => (b.parcels[0]?.max_units ?? 0) - (a.parcels[0]?.max_units ?? 0));
   } else {
     sorted.sort((a, b) => (b.meeting_date ?? "").localeCompare(a.meeting_date ?? ""));
   }

@@ -12,12 +12,16 @@ interface DealSheetDrawerProps {
 }
 
 export default function DealSheetDrawer({ lead, onClose }: DealSheetDrawerProps) {
-  const headline = lead.parcel ? lead.parcel.address : "Policy Amendment";
+  const primaryParcel = lead.parcels[0] ?? null;
+  const additionalParcelCount = Math.max(lead.parcels.length - 1, 0);
+  const headline = primaryParcel ? primaryParcel.address : "Policy Amendment";
   const scope =
     lead.affected_districts && lead.affected_districts.length > 0
       ? lead.affected_districts.join(", ")
       : "Citywide";
-  const subheadline = lead.parcel ? `${lead.parcel.city}, ${lead.parcel.county} County` : scope;
+  const subheadline = primaryParcel
+    ? `${primaryParcel.city}, ${primaryParcel.county} County`
+    : scope;
 
   const pdfLabel = lead.page_number
     ? `View Agenda PDF (Page ${lead.page_number})`
@@ -36,8 +40,15 @@ export default function DealSheetDrawer({ lead, onClose }: DealSheetDrawerProps)
               <p className="truncate font-mono text-[10px] uppercase tracking-widest text-slate-500">
                 {lead.jurisdiction} · {lead.meeting_date ?? "Meeting date unknown"}
               </p>
-              <h2 className="mt-0.5 truncate text-lg font-semibold text-slate-100" title={headline}>
-                {headline}
+              <h2 className="mt-0.5 flex items-center gap-2 text-lg font-semibold text-slate-100">
+                <span className="truncate" title={headline}>
+                  {headline}
+                </span>
+                {additionalParcelCount > 0 && (
+                  <span className="shrink-0 rounded-sm bg-slate-800 px-1.5 py-0.5 font-mono text-[10px] font-medium text-slate-400">
+                    +{additionalParcelCount} more
+                  </span>
+                )}
               </h2>
               <p className="truncate text-xs text-slate-500">{subheadline}</p>
             </div>
@@ -66,37 +77,56 @@ export default function DealSheetDrawer({ lead, onClose }: DealSheetDrawerProps)
 
         <div className="flex-1 overflow-y-auto px-5 py-5">
           <section>
-            <p className="text-xs uppercase tracking-wider text-slate-500">Parcel Breakdown</p>
-            {lead.parcel ? (
-              <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
-                <div>
-                  <dt className="text-[11px] uppercase tracking-wide text-slate-600">APN</dt>
-                  <dd className="mt-0.5 font-mono text-slate-100">{lead.parcel.apn}</dd>
-                </div>
-                <div>
-                  <dt className="text-[11px] uppercase tracking-wide text-slate-600">
-                    Max Unit Yield
-                  </dt>
-                  <dd className="mt-0.5 font-mono tabular-nums text-slate-100">
-                    {lead.parcel.max_units !== null ? `${lead.parcel.max_units} units` : "N/A"}
-                  </dd>
-                </div>
-                <div className="col-span-2">
-                  <dt className="text-[11px] uppercase tracking-wide text-slate-600">
-                    Zoning Change
-                  </dt>
-                  <dd className="mt-1">
-                    <ZoningChange
-                      current={lead.parcel.current_zoning}
-                      proposed={lead.parcel.proposed_zoning}
-                    />
-                  </dd>
-                </div>
-              </dl>
+            <p className="text-xs uppercase tracking-wider text-slate-500">
+              Parcel Breakdown
+              {lead.parcels.length > 1 && (
+                <span className="ml-1.5 normal-case text-slate-600">
+                  ({lead.parcels.length} parcels)
+                </span>
+              )}
+            </p>
+            {lead.parcels.length > 0 ? (
+              <div className="mt-2 flex flex-col gap-3">
+                {lead.parcels.map((parcel) => (
+                  <div
+                    key={parcel.id}
+                    className="rounded-sm border border-slate-800 bg-slate-900/60 p-3"
+                  >
+                    <p className="truncate text-sm text-slate-100">{parcel.address}</p>
+                    <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
+                      <div>
+                        <dt className="text-[11px] uppercase tracking-wide text-slate-600">
+                          APN
+                        </dt>
+                        <dd className="mt-0.5 font-mono text-slate-100">{parcel.apn}</dd>
+                      </div>
+                      <div>
+                        <dt className="text-[11px] uppercase tracking-wide text-slate-600">
+                          Max Unit Yield
+                        </dt>
+                        <dd className="mt-0.5 font-mono tabular-nums text-slate-100">
+                          {parcel.max_units !== null ? `${parcel.max_units} units` : "N/A"}
+                        </dd>
+                      </div>
+                      <div className="col-span-2">
+                        <dt className="text-[11px] uppercase tracking-wide text-slate-600">
+                          Zoning Change
+                        </dt>
+                        <dd className="mt-1">
+                          <ZoningChange
+                            current={parcel.current_zoning}
+                            proposed={parcel.proposed_zoning}
+                          />
+                        </dd>
+                      </div>
+                    </dl>
+                  </div>
+                ))}
+              </div>
             ) : (
-              // Simplified for a POLICY_AMENDMENT lead — no single parcel,
-              // so APN/zoning/unit-yield are all genuinely N/A rather than
-              // just missing data.
+              // Simplified for a POLICY_AMENDMENT lead — no parcels at
+              // all, so APN/zoning/unit-yield are all genuinely N/A
+              // rather than just missing data.
               <div className="mt-2 rounded-sm border border-slate-800 bg-slate-900/60 p-3">
                 <p className="text-sm text-slate-300">
                   N/A — a policy amendment has no single subject parcel.

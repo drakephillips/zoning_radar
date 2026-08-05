@@ -30,9 +30,12 @@ Two tiers, tried in order:
 
 TODO(parcel-api): this covers San Mateo County only, and its matching is
 best-effort — ambiguous for a multi-address string like "123 Foo St and
-456 Bar Ave" (only the first is used; see _first_address) or a building
-complex where several APNs share one situs address (see the "distinct
-APNs" log line in _query_smc_parcels_by_address). For broader geographic
+456 Bar Ave" (only the first address is resolved; see _first_address). A
+building complex where several APNs share one situs address is no longer
+a limitation — resolve_apns_from_address returns every matching APN (see
+the "distinct APNs" log line in _query_smc_parcels_by_address), and
+routers/ingest.py links a lead to all of them via the lead_parcels
+junction table rather than picking just one. For broader geographic
 coverage or more precise resolution, swap in a dedicated parcel API here
 — Regrid (https://regrid.com, nationwide parcel data, paid API) or
 another county's own ArcGIS service for leads outside San Mateo County.
@@ -89,6 +92,16 @@ def _escape_sql_literal(value: str) -> str:
     return value.replace("'", "''")
 
 
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            ordered.append(value)
+    return ordered
+
+
 def _run_smc_address_query(address: str, city: str | None) -> list[str]:
     where_clauses = [f"SITUS_ADDR LIKE '%{_escape_sql_literal(address.upper())}%'"]
     if city:
@@ -111,7 +124,7 @@ def _run_smc_address_query(address: str, city: str | None) -> list[str]:
     ]
 
 
-def _query_smc_parcels_by_address(address: str, city: str | None) -> str | None:
+def _query_smc_parcels_by_address(address: str, city: str | None) -> list[str]:
     """Tier 1: direct attribute query against San Mateo County's own
     ACRE/ACTIVE_PARCELS layer, matching `address` against its SITUS_ADDR
     field. Tries scoped to `city` first (SITUS_CITY equality) when given,
@@ -120,24 +133,27 @@ def _query_smc_parcels_by_address(address: str, city: str | None) -> str | None:
     scoped query finds nothing, since the county's own SITUS_CITY spelling
     doesn't always match a jurisdiction name confirmed live (a real S. San
     Francisco parcel had no match at all until the city filter was
-    dropped). Returns the first matching APN, or None if nothing matched
-    either way."""
+    dropped). Returns every distinct matching APN (confirmed live: e.g.
+    "1540 El Camino Real" matches 2 distinct APNs sharing that situs
+    address — a real multi-parcel case, not a data error) — never just the
+    first, so a caller can associate a lead with all of them rather than
+    silently dropping every parcel but one."""
     apns = _run_smc_address_query(address, city)
     if not apns and city:
         apns = _run_smc_address_query(address, None)
 
     if not apns:
-        return None
+        return []
     distinct = sorted(set(apns))
     if len(distinct) > 1:
         logger.info(
-            "SMC parcel address lookup for %r matched %d distinct APNs (%s) — using the "
-            "first one.",
+            "SMC parcel address lookup for %r matched %d distinct APNs (%s) — returning all "
+            "of them.",
             address,
             len(distinct),
             distinct,
         )
-    return apns[0]
+    return distinct
 
 
 def _geocode_via_nominatim(address: str, city: str | None) -> tuple[float, float] | None:
@@ -157,12 +173,13 @@ def _geocode_via_nominatim(address: str, city: str | None) -> tuple[float, float
     return float(results[0]["lat"]), float(results[0]["lon"])
 
 
-def _query_smc_parcels_by_point(lat: float, lon: float) -> str | None:
+def _query_smc_parcels_by_point(lat: float, lon: float) -> list[str]:
     """Tier 2: spatial point-in-polygon query against the same SMC parcel
     layer, using a geocoded point instead of address text. inSR=4326
     tells ArcGIS the input point is WGS84 lat/lon and to reproject it
     itself into the layer's native EPSG:2227 rather than requiring that
-    conversion client-side."""
+    conversion client-side. Returns every matching APN — a point can land
+    on more than one polygon at a shared boundary — never just the first."""
     params = {
         "geometry": f"{lon},{lat}",
         "geometryType": "esriGeometryPoint",
@@ -181,27 +198,31 @@ def _query_smc_parcels_by_point(lat: float, lon: float) -> str | None:
         for feature in payload.get("features") or []
         if feature.get("attributes", {}).get("APN")
     ]
-    return apns[0] if apns else None
+    return _dedupe_preserve_order(apns)
 
 
-def resolve_apn_from_address(address: str, city: str) -> str | None:
+def resolve_apns_from_address(address: str, city: str) -> list[str]:
     """Best-effort JIT APN resolution for a real street address with no
     printed APN. Tries San Mateo County's own parcel layer directly by
     address text first, then falls back to geocoding + a spatial lookup
-    against the same layer. Returns None (never raises) if neither tier
-    resolves anything or if a request fails — a resolution failure is
-    treated exactly like "no APN available", the same outcome
-    _persist_to_supabase already handles for a lead with no address at
-    all, rather than letting a network hiccup here crash the ingest run."""
+    against the same layer. Returns every APN matched by whichever tier
+    found something — a lead can legitimately span more than one parcel
+    (an assemblage of adjacent lots, or several APNs sharing one situs
+    address, both confirmed live) — never just the first. Returns an empty
+    list (never raises) if neither tier resolves anything or if a request
+    fails — a resolution failure is treated exactly like "no APN
+    available", the same outcome _persist_to_supabase already handles for
+    a lead with no address at all, rather than letting a network hiccup
+    here crash the ingest run."""
     if not address or not address.strip():
-        return None
+        return []
 
     target_address = _first_address(address)
 
     try:
-        apn = _query_smc_parcels_by_address(target_address, city)
-        if apn:
-            return apn
+        apns = _query_smc_parcels_by_address(target_address, city)
+        if apns:
+            return apns
     except Exception:
         logger.warning(
             "SMC parcel address lookup failed for %r — falling back to geocoding.",
@@ -212,10 +233,10 @@ def resolve_apn_from_address(address: str, city: str) -> str | None:
     try:
         point = _geocode_via_nominatim(target_address, city)
         if point is None:
-            return None
+            return []
         return _query_smc_parcels_by_point(*point)
     except Exception:
         logger.warning(
             "Geocode/spatial APN resolution failed for %r.", target_address, exc_info=True
         )
-        return None
+        return []

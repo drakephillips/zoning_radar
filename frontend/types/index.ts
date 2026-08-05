@@ -25,9 +25,6 @@ export interface Parcel {
 
 export interface RezoningLeadDetail {
   id: string;
-  // Null for a POLICY_AMENDMENT lead — see LeadType. Always set for
-  // SITE_SPECIFIC.
-  parcel_id: string | null;
   document_id: string;
   lead_type: LeadType;
   signal_strength: SignalStrength;
@@ -38,13 +35,16 @@ export interface RezoningLeadDetail {
   affected_districts: string[] | null;
   meeting_date: string | null;
   created_at: string;
-  // Null exactly when parcel_id is null — always check this before reading
-  // parcel-derived fields (address, apn, owner info, zoning, etc.).
-  parcel: Parcel | null;
+  // One or more parcels this lead is linked to (via the backend's
+  // lead_parcels junction table) — a development can span an assemblage
+  // of adjacent lots, so this is never assumed to have exactly one entry.
+  // Empty for a POLICY_AMENDMENT lead — see LeadType. Always check length
+  // before reading parcel-derived fields (address, apn, zoning, etc.).
+  parcels: Parcel[];
   agenda_source_url: string;
   // The source document's own city — always present, regardless of
-  // lead_type. Use this for display/filtering instead of parcel?.city,
-  // which is null for a POLICY_AMENDMENT lead.
+  // lead_type. Use this for display/filtering instead of a parcel's own
+  // city, which no POLICY_AMENDMENT lead has any of.
   jurisdiction: string;
   // The source PDF page this lead was found on. Null for a lead inserted
   // before this column existed — the drawer's source-document link falls
@@ -53,7 +53,7 @@ export interface RezoningLeadDetail {
 }
 
 // SORT_RECENT: newest meeting_date first. SORT_YIELD: highest
-// parcel.max_units first — a POLICY_AMENDMENT lead has no parcel/unit
+// parcels[0].max_units first — a POLICY_AMENDMENT lead has no parcels/unit
 // count, so it naturally sorts to the bottom under this order, which is
 // the correct behavior (it has no yield figure to rank by).
 export type SortOrder = "recent" | "yield";

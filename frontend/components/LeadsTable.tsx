@@ -70,11 +70,24 @@ export default function LeadsTable({
                 </td>
                 <td className="truncate px-3 py-2 text-slate-300">{lead.jurisdiction}</td>
                 <td className="px-3 py-2 text-slate-300">
-                  {lead.parcel ? (
+                  {lead.parcels.length > 0 ? (
                     <>
-                      <span className="block truncate">{lead.parcel.address}</span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="truncate">{lead.parcels[0].address}</span>
+                        {lead.parcels.length > 1 && (
+                          <span
+                            className="shrink-0 rounded-sm bg-slate-800 px-1.5 py-0.5 font-sans text-[10px] font-medium text-slate-400"
+                            title={lead.parcels
+                              .slice(1)
+                              .map((p) => p.address)
+                              .join(", ")}
+                          >
+                            +{lead.parcels.length - 1} more
+                          </span>
+                        )}
+                      </span>
                       <span className="block truncate text-xs text-slate-600">
-                        {lead.parcel.apn}
+                        {lead.parcels[0].apn}
                       </span>
                     </>
                   ) : (
@@ -94,7 +107,9 @@ export default function LeadsTable({
                   {lead.entitlement_type ?? "—"}
                 </td>
                 <td className="px-3 py-2 text-right tabular-nums text-slate-300">
-                  {lead.parcel && lead.parcel.max_units !== null ? `+${lead.parcel.max_units}` : "—"}
+                  {lead.parcels[0] && lead.parcels[0].max_units !== null
+                    ? `+${lead.parcels[0].max_units}`
+                    : "—"}
                 </td>
                 <td className="px-3 py-2 font-sans">
                   <div className="flex justify-center">

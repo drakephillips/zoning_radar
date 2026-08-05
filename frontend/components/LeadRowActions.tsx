@@ -1,12 +1,20 @@
 "use client";
 
 import { Download, FileText } from "lucide-react";
-import type { RezoningLeadDetail } from "@/types";
+import type { Parcel, RezoningLeadDetail } from "@/types";
 
-function exportOwnerInfo(parcel: NonNullable<RezoningLeadDetail["parcel"]>) {
+/** One row per linked parcel — a lead can span an assemblage of several
+ * parcels (see backend's lead_parcels junction table), each with its own
+ * owner, so exporting only the first would silently drop the rest. */
+function exportOwnerInfo(parcels: Parcel[]) {
   const rows = [
-    ["APN", "Owner Name", "Owner Address"],
-    [parcel.apn, parcel.owner_name ?? "", parcel.owner_address ?? ""],
+    ["APN", "Address", "Owner Name", "Owner Address"],
+    ...parcels.map((parcel) => [
+      parcel.apn,
+      parcel.address,
+      parcel.owner_name ?? "",
+      parcel.owner_address ?? "",
+    ]),
   ];
   const csv = rows.map((row) => row.map((cell) => `"${cell}"`).join(",")).join("\n");
   const blob = new Blob([csv], { type: "text/csv" });
@@ -14,7 +22,7 @@ function exportOwnerInfo(parcel: NonNullable<RezoningLeadDetail["parcel"]>) {
 
   const link = document.createElement("a");
   link.href = url;
-  link.download = `owner-${parcel.apn}.csv`;
+  link.download = `owner-${parcels[0].apn}.csv`;
   link.click();
   URL.revokeObjectURL(url);
 }
@@ -32,12 +40,12 @@ export default function LeadRowActions({ lead }: { lead: RezoningLeadDetail }) {
       >
         <FileText className="h-3.5 w-3.5" />
       </a>
-      {/* A policy amendment has no single parcel/owner to export — see
-          LeadType. Only a SITE_SPECIFIC lead's parcel has owner info. */}
-      {lead.parcel && (
+      {/* A policy amendment has no parcels/owners to export — see
+          LeadType. Only a SITE_SPECIFIC lead has any linked parcels. */}
+      {lead.parcels.length > 0 && (
         <button
           type="button"
-          onClick={() => exportOwnerInfo(lead.parcel!)}
+          onClick={() => exportOwnerInfo(lead.parcels)}
           title="Export Owner Info"
           aria-label="Export Owner Info"
           className="inline-flex h-7 w-7 items-center justify-center rounded-sm border border-slate-700 text-slate-400 transition-colors hover:bg-slate-800 hover:text-slate-200"

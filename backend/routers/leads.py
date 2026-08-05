@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/leads", tags=["leads"])
 
-_SELECT = "*, parcel:parcels(*), document:documents(file_url, city_name)"
+_SELECT = "*, lead_parcels(parcel:parcels(*)), document:documents(file_url, city_name)"
 
 
 @router.get("", response_model=list[RezoningLeadDetail])
@@ -34,14 +34,22 @@ async def list_leads(
 
         return [
             RezoningLeadDetail(
-                **{k: v for k, v in row.items() if k != "document"},
+                **{k: v for k, v in row.items() if k not in ("document", "lead_parcels")},
+                # PostgREST returns the many-to-many embed as a list of
+                # junction rows, each wrapping its joined parcel — flatten
+                # that into the plain list of Parcels RezoningLeadDetail
+                # expects. Empty for a POLICY_AMENDMENT lead, which has no
+                # lead_parcels rows at all (see LeadType).
+                parcels=[
+                    lp["parcel"] for lp in (row.get("lead_parcels") or []) if lp.get("parcel")
+                ],
                 agenda_source_url=row["document"]["file_url"],
                 # documents.city_name is NOT NULL, so this is always a real
-                # value for every lead regardless of lead_type — unlike
-                # parcel.city, which is null for a POLICY_AMENDMENT lead
-                # (no single parcel). The frontend's Jurisdiction column
-                # reads this field directly rather than falling back to
-                # parcel.city, so both lead types map correctly.
+                # value for every lead regardless of lead_type — unlike a
+                # parcel's own city, which no POLICY_AMENDMENT lead has any
+                # of (no single parcel). The frontend's Jurisdiction column
+                # reads this field directly rather than falling back to a
+                # parcel's city, so both lead types map correctly.
                 jurisdiction=row["document"]["city_name"],
             )
             for row in rows

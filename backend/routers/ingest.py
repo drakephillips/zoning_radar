@@ -25,7 +25,7 @@ from models.schemas import (
     LeadType,
     Parcel,
 )
-from services.parcel_resolver import resolve_apn_from_address
+from services.parcel_resolver import resolve_apns_from_address
 from services.pdf_parser import IngestCancelled, extract_signals_from_pdf
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,7 @@ def _ensure_parcel_exists(
     max_units: int | None = None,
 ) -> None:
     """Upserts a minimal parcels row for `apn` if one doesn't already
-    exist, so rezoning_leads.parcel_id's foreign key can be satisfied for
+    exist, so lead_parcels.parcel_id's foreign key can be satisfied for
     a lead whose APN was just resolved just-in-time (see
     services/parcel_resolver.py) rather than already present in the
     table. ignore_duplicates=True gives ON CONFLICT DO NOTHING — this
@@ -182,49 +182,56 @@ def _persist_to_supabase(
         if signal.lead_type == LeadType.POLICY_AMENDMENT:
             # A macro policy change has no single subject parcel — never
             # gated on an APN/parcel match, unlike SITE_SPECIFIC below.
-            parcel_id = None
+            resolved_parcel_ids: list[str] = []
             summary = (
                 f"Policy amendment affecting {', '.join(signal.affected_districts)}"
                 if signal.affected_districts
                 else f"Policy amendment: {signal.matched_keyword}"
             )
         else:
-            resolved_apn = signal.apn
+            # A single printed APN becomes a one-element list; otherwise
+            # resolve_apns_from_address may return several (an assemblage
+            # of adjacent lots, or several APNs sharing one situs address
+            # — both confirmed live) — a lead is never forced onto just
+            # one parcel when the source material genuinely names more.
+            resolved_apns = [signal.apn] if signal.apn else []
             try:
-                if resolved_apn is None and signal.address:
+                if not resolved_apns and signal.address:
                     # No APN was printed in the source document — try to
-                    # resolve one just-in-time from the address instead
-                    # of dropping an otherwise-real lead (confirmed live
-                    # this session: a real scrape produced 27 genuine
+                    # resolve one (or more) just-in-time from the address
+                    # instead of dropping an otherwise-real lead (confirmed
+                    # live this session: a real scrape produced 27 genuine
                     # site-specific leads with real addresses and no APN,
                     # none of which could persist before this).
-                    resolved_apn = resolve_apn_from_address(signal.address, city_name)
-                    if resolved_apn:
+                    resolved_apns = resolve_apns_from_address(signal.address, city_name)
+                    if resolved_apns:
                         logger.info(
-                            "Resolved APN %s for %r via JIT lookup — no APN was printed "
+                            "Resolved APN(s) %s for %r via JIT lookup — no APN was printed "
                             "in the source document.",
-                            resolved_apn,
+                            resolved_apns,
                             signal.address,
                         )
 
-                if resolved_apn is None:
+                if not resolved_apns:
                     continue
 
-                # Guarantees a parcels row exists for resolved_apn before
-                # the lead insert below needs to satisfy its foreign key
-                # — necessary whether resolved_apn came from Gemini
-                # directly or from the JIT lookup just now, since either
-                # way the parcels table may have no matching row yet.
-                _ensure_parcel_exists(
-                    resolved_apn,
-                    address=signal.address or f"Unmatched — parsed from page {signal.page_number}",
-                    city=signal.city or city_name,
-                    current_zoning=signal.current_zoning,
-                    proposed_zoning=signal.proposed_zoning,
-                    max_units=signal.unit_count,
-                )
+                # Guarantees a parcels row exists for every resolved APN
+                # before the lead_parcels inserts below need to satisfy
+                # their foreign key — necessary whether an APN came from
+                # Gemini directly or from the JIT lookup just now, since
+                # either way the parcels table may have no matching row yet.
+                for apn in resolved_apns:
+                    _ensure_parcel_exists(
+                        apn,
+                        address=signal.address
+                        or f"Unmatched — parsed from page {signal.page_number}",
+                        city=signal.city or city_name,
+                        current_zoning=signal.current_zoning,
+                        proposed_zoning=signal.proposed_zoning,
+                        max_units=signal.unit_count,
+                    )
             except Exception:
-                # Covers both resolve_apn_from_address (a network call to
+                # Covers both resolve_apns_from_address (a network call to
                 # two external, third-party services) and
                 # _ensure_parcel_exists (a Supabase write) — neither
                 # should ever be able to take down the rest of this
@@ -238,40 +245,56 @@ def _persist_to_supabase(
                 continue
 
             parcel_rows = (
-                supabase.table("parcels").select("id").eq("apn", resolved_apn).execute().data
+                supabase.table("parcels").select("id").in_("apn", resolved_apns).execute().data
             )
             if not parcel_rows:
                 continue
-            parcel_id = parcel_rows[0]["id"]
-            summary = f"Matched '{signal.matched_keyword}' near APN {resolved_apn}"
+            resolved_parcel_ids = [row["id"] for row in parcel_rows]
+            summary = (
+                f"Matched '{signal.matched_keyword}' near APN {resolved_apns[0]}"
+                if len(resolved_apns) == 1
+                else f"Matched '{signal.matched_keyword}' spanning {len(resolved_apns)} "
+                f"parcels ({', '.join(resolved_apns)})"
+            )
 
-        # Upserts on (parcel_id, meeting_date) — see database/schema.sql's
-        # rezoning_leads_parcel_meeting_date_key — so a SITE_SPECIFIC lead
-        # already inserted by a different document (e.g. an earlier Agenda
-        # PDF for the same meeting) gets refreshed in place instead of
-        # duplicated. For a POLICY_AMENDMENT lead parcel_id is always None,
-        # which never conflicts with anything (Postgres treats every NULL
-        # as distinct), so this behaves like a plain insert for those rows.
-        supabase.table("rezoning_leads").upsert(
-            {
-                "parcel_id": parcel_id,
-                "document_id": document_id,
-                "lead_type": signal.lead_type.value,
-                "signal_strength": signal.signal_strength.value,
-                "summary": summary,
-                "extracted_text_snippet": signal.extracted_text_snippet,
-                "entitlement_type": signal.entitlement_type,
-                "affected_districts": signal.affected_districts,
-                # rezoning_leads.meeting_date is a strict `date` column —
-                # fall back to the parent document's meeting_date (set
-                # above) when this specific signal didn't have its own, so
-                # a lead is never left with a null date it could otherwise
-                # have inherited from the document it came from.
-                "meeting_date": signal.meeting_date or document_meeting_date,
-                "page_number": signal.page_number,
-            },
-            on_conflict="parcel_id,meeting_date",
-        ).execute()
+        # Inserted exactly once regardless of how many parcels this lead
+        # spans — see lead_parcels below, which is what links it to each
+        # of resolved_parcel_ids. This is the actual fix for the old bug:
+        # a multi-parcel lead used to get forced onto a single parcel_id
+        # column instead of one lead row fanning out to several links.
+        lead_row = (
+            supabase.table("rezoning_leads")
+            .insert(
+                {
+                    "document_id": document_id,
+                    "lead_type": signal.lead_type.value,
+                    "signal_strength": signal.signal_strength.value,
+                    "summary": summary,
+                    "extracted_text_snippet": signal.extracted_text_snippet,
+                    "entitlement_type": signal.entitlement_type,
+                    "affected_districts": signal.affected_districts,
+                    # rezoning_leads.meeting_date is a strict `date` column
+                    # — fall back to the parent document's meeting_date
+                    # (set above) when this specific signal didn't have
+                    # its own, so a lead is never left with a null date it
+                    # could otherwise have inherited from the document it
+                    # came from.
+                    "meeting_date": signal.meeting_date or document_meeting_date,
+                    "page_number": signal.page_number,
+                }
+            )
+            .execute()
+            .data[0]
+        )
+
+        if resolved_parcel_ids:
+            supabase.table("lead_parcels").insert(
+                [
+                    {"lead_id": lead_row["id"], "parcel_id": parcel_id}
+                    for parcel_id in resolved_parcel_ids
+                ]
+            ).execute()
+
         leads_created += 1
 
     supabase.table("documents").update(
