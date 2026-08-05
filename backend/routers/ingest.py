@@ -223,7 +223,14 @@ def _persist_to_supabase(
             parcel_id = parcel_rows[0]["id"]
             summary = f"Matched '{signal.matched_keyword}' near APN {resolved_apn}"
 
-        supabase.table("rezoning_leads").insert(
+        # Upserts on (parcel_id, meeting_date) — see database/schema.sql's
+        # rezoning_leads_parcel_meeting_date_key — so a SITE_SPECIFIC lead
+        # already inserted by a different document (e.g. an earlier Agenda
+        # PDF for the same meeting) gets refreshed in place instead of
+        # duplicated. For a POLICY_AMENDMENT lead parcel_id is always None,
+        # which never conflicts with anything (Postgres treats every NULL
+        # as distinct), so this behaves like a plain insert for those rows.
+        supabase.table("rezoning_leads").upsert(
             {
                 "parcel_id": parcel_id,
                 "document_id": document_id,
@@ -240,7 +247,8 @@ def _persist_to_supabase(
                 # have inherited from the document it came from.
                 "meeting_date": signal.meeting_date or document_meeting_date,
                 "page_number": signal.page_number,
-            }
+            },
+            on_conflict="parcel_id,meeting_date",
         ).execute()
         leads_created += 1
 

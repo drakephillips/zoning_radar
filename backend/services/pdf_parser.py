@@ -71,6 +71,16 @@ def _check_cancelled(should_cancel: CancelCheck | None) -> None:
 # San Mateo County APNs are formatted as three groups of digits, e.g. 042-311-090
 APN_PATTERN = re.compile(r"\b(\d{3}-\d{3}-\d{3})\b")
 
+# Full-shape gate for a Gemini-reported APN (see _GeminiLeadItem's
+# apn validator below): matches exactly the two shapes the field's own
+# description documents as valid — "XXX-XXX-XXX" (standard 3-3-3) or
+# "XXX-XXXX-XXX" (a 4-digit middle group seen in some jurisdictions/OCR'd
+# tables) — both always ending in a 3-digit final group. A US phone number
+# is shaped XXX-XXX-XXXX (3-3-4, four digits *last*), which this pattern
+# never matches — that mismatch is what makes it a reliable phone-number
+# rejector, not just an "only digits and hyphens" check.
+GEMINI_APN_SHAPE_PATTERN = re.compile(r"^\d{3}-\d{3,4}-\d{3}$")
+
 # Zoning code, e.g. "R-1", "R1", "RM-20", "PD-2"
 _ZONING_CODE = r"[A-Z]{1,3}-?\d{1,3}"
 
@@ -915,6 +925,15 @@ Ignore, and never report as a lead of either type:
 - Procedural boilerplate (roll call, minutes approval, adjournment, pledge of allegiance).
 - Public notice radius lists — addresses of neighboring parcels notified of a hearing, not the
   parcel actually under consideration.
+- Page footers/headers: page numbers, document control codes, "Page X of Y", printed/revision
+  dates, and agenda packet file names — these are pagination artifacts, never project detail.
+- Staff/directory listings: the City Clerk, Council/Commission roster, department contact list,
+  or any "For more information, contact..." block. A phone number in this kind of listing (e.g.
+  "(650) 555-1234" or "650-555-1234") is a CONTACT NUMBER, never an APN, unit count, or any other
+  lead field — do not extract it into any field under any circumstances.
+- Generic city boilerplate: mission statements, ADA/accessibility notices, meeting-procedure
+  instructions ("public comment is limited to 3 minutes"), and standard agenda cover-page text
+  that repeats on every packet regardless of what's being heard that day.
 
 For a SITE_SPECIFIC lead:
 - Use the parcel's Assessor Parcel Number (APN) as the identifier, but only if it is printed in
@@ -1083,9 +1102,12 @@ class _GeminiLeadItem(BaseModel):
         default=None,
         description=(
             "The Assessor's Parcel Number (APN). Must strictly follow numeric formats like "
-            "'XXX-XXX-XXX' or 'XXX-XXXX-XXX'. Do NOT substitute an address. If a valid numeric "
-            "APN is not explicitly stated in the document, you must return null. Always null "
-            "for a POLICY_AMENDMENT lead — a macro policy change has no single parcel."
+            "'XXX-XXX-XXX' or 'XXX-XXXX-XXX'. Do NOT substitute an address, and NEVER a phone "
+            "number (e.g. '650-555-1234' is a contact number, not an APN, even though it is "
+            "also digits and hyphens) — a real APN's final group is always exactly 3 digits, "
+            "never 4. If a valid numeric APN is not explicitly stated in the document, you must "
+            "return null. Always null for a POLICY_AMENDMENT lead — a macro policy change has "
+            "no single parcel."
         ),
     )
     # Only ever populated for a POLICY_AMENDMENT lead — the district(s),
@@ -1122,14 +1144,21 @@ class _GeminiLeadItem(BaseModel):
         """Belt-and-suspenders alongside the field description and prompt
         constraints above: Gemini has been observed hallucinating an
         address into this field (e.g. "ADDR: 320 Sheridan Dr.") when no
-        real APN is printed, despite being told not to. A real APN is
-        digits/hyphens only, so anything containing a letter gets nulled
-        out here rather than trusting the model's own restraint."""
+        real APN is printed, despite being told not to — and, in
+        production, a City Clerk/staff phone number (e.g. "650-555-1234")
+        has been observed coming through here too. An "only digits and
+        hyphens" check alone doesn't catch that: a phone number contains
+        no letters, so it would pass a bare alpha check right through.
+        This instead requires the value to fully match one of the two
+        real APN shapes (see GEMINI_APN_SHAPE_PATTERN) — a phone number's
+        3-3-4 digit grouping matches neither, so it gets nulled out here
+        rather than trusting the model's own restraint."""
         if value is None:
             return None
-        if any(char.isalpha() for char in value):
+        candidate = value.strip()
+        if not GEMINI_APN_SHAPE_PATTERN.match(candidate):
             return None
-        return value
+        return candidate
 
     @field_validator("meeting_date", mode="before")
     @classmethod
@@ -1161,6 +1190,19 @@ class _GeminiChunkResult(BaseModel):
     impossible for Stage 2 to report a different one."""
 
     leads: list[_GeminiLeadItem] = Field(default_factory=list)
+
+
+def _has_required_fields(item: _GeminiLeadItem) -> bool:
+    """A lead missing either field is treated as too low-quality to
+    persist — usually a hallucinated match with no real meeting context or
+    named entitlement behind it (e.g. a stray keyword match against
+    boilerplate). Applied only to Gemini-extracted leads (see
+    _extract_via_gemini's caller) — the regex/heuristic fallback pipeline
+    never populates entitlement_type at all, so applying this gate there
+    would silently drop every single fallback-pipeline lead."""
+    has_meeting_date = bool(item.meeting_date)
+    has_entitlement_type = bool(item.entitlement_type and item.entitlement_type.strip())
+    return has_meeting_date and has_entitlement_type
 
 
 def is_gemini_configured() -> bool:
@@ -1370,6 +1412,20 @@ def _extract_via_gemini(
                 )
                 continue
             lead_items.extend(chunk_result.leads)
+
+    accepted_items: list[_GeminiLeadItem] = []
+    for item in lead_items:
+        if not _has_required_fields(item):
+            logger.info(
+                "Dropping Gemini-extracted lead — missing required field(s) "
+                "(meeting_date=%r, entitlement_type=%r): %s",
+                item.meeting_date,
+                item.entitlement_type,
+                item.reasoning,
+            )
+            continue
+        accepted_items.append(item)
+    lead_items = accepted_items
 
     signals = [
         ExtractedParcelSignal(

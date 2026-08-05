@@ -109,7 +109,17 @@ create table rezoning_leads (
   -- PDF (Page N)" deep link. Nullable since rows inserted before this
   -- column existed have no value for it — every new insert always sets it.
   page_number integer,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  -- Dedupes SITE_SPECIFIC leads for the same parcel+meeting: two documents
+  -- describing the same item (e.g. an Agenda PDF and a later Minutes PDF
+  -- for the same meeting, or a re-scrape under a slightly different URL)
+  -- upsert onto the same row instead of creating a duplicate (see
+  -- backend/routers/ingest.py's _persist_to_supabase, which upserts on
+  -- this exact pair). Postgres treats every NULL as distinct from every
+  -- other NULL, so this never restricts POLICY_AMENDMENT leads (parcel_id
+  -- is always null there — see lead_type) — only SITE_SPECIFIC leads,
+  -- which is exactly the case being deduped.
+  constraint rezoning_leads_parcel_meeting_date_key unique (parcel_id, meeting_date)
 );
 
 create index rezoning_leads_parcel_id_idx on rezoning_leads (parcel_id);
