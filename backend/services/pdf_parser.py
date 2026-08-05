@@ -8,13 +8,14 @@ and friends) — which is also what keeps local development and tests fully
 offline, with no API cost or network dependency.
 
 Text extraction (_extract_pdf_text) falls back to OCR (pytesseract) for any
-page pdfplumber can't get text from directly — necessary for scanned,
-image-only municipal PDFs, which are common for older agendas. This needs
-two system binaries beyond the pip packages: the `tesseract` OCR engine and
-`poppler` (for rendering PDF pages to images) — e.g. `brew install
-tesseract poppler` on macOS, `apt-get install tesseract-ocr poppler-utils`
-on Debian/Ubuntu."""
+page PyMuPDF can't get text from directly — necessary for scanned,
+image-only municipal PDFs, which are common for older agendas. PyMuPDF
+(fitz) both reads the PDF and rasterizes the one page OCR needs, so the
+only system binary beyond the pip packages is the `tesseract` OCR engine
+itself — e.g. `brew install tesseract` on macOS, `apt-get install
+tesseract-ocr` on Debian/Ubuntu."""
 
+import gc
 import logging
 import os
 import re
@@ -22,9 +23,8 @@ import time
 from datetime import date
 from typing import Callable, Literal
 
-import pdfplumber
+import fitz
 import pytesseract
-from pdf2image import convert_from_path
 from pydantic import BaseModel, Field, field_validator
 
 from models.schemas import DocumentClassification, ExtractedParcelSignal, LeadType, SignalStrength
@@ -698,35 +698,35 @@ def _dedupe_by_apn(signals: list[ExtractedParcelSignal]) -> list[ExtractedParcel
     return [*best_by_apn.values(), *unresolved]
 
 
-def _ocr_page(pdf_path: str, page_number: int) -> str:
-    """OCR fallback for a page pdfplumber couldn't extract text from —
-    typically a scanned/image-only page with no text layer at all. Renders
-    just that one page to an image (via poppler, reading directly from
-    disk rather than needing the whole PDF's bytes in memory) and runs
-    Tesseract over it, rather than re-rendering the whole document for
-    every blank page."""
+def _ocr_page(doc: "fitz.Document", page_number: int) -> str:
+    """OCR fallback for a page with no extractable text layer at all
+    (typically a scanned/image-only page). Renders just that one page to a
+    raster image via PyMuPDF's own page.get_pixmap() — no separate poppler
+    process/full-document render needed — then runs Tesseract over it.
+    The Pixmap is explicitly freed and garbage-collected right after use so
+    a 40+ MB, image-heavy PDF's RAM footprint doesn't creep up page by page
+    over a long OCR run."""
+    page = doc[page_number - 1]  # fitz pages are 0-indexed; callers use 1-based page_number
     try:
-        images = convert_from_path(pdf_path, first_page=page_number, last_page=page_number)
+        pix = page.get_pixmap()
     except Exception:
-        logger.exception(
-            "OCR page rendering failed for page %d (is poppler installed? "
-            "e.g. `brew install poppler`)",
-            page_number,
-        )
-        return ""
-
-    if not images:
+        logger.exception("OCR page rendering failed for page %d", page_number)
         return ""
 
     try:
-        return pytesseract.image_to_string(images[0]) or ""
-    except Exception:
-        logger.exception(
-            "Tesseract OCR failed for page %d (is tesseract installed? "
-            "e.g. `brew install tesseract`)",
-            page_number,
-        )
-        return ""
+        image = pix.pil_image()
+        try:
+            return pytesseract.image_to_string(image) or ""
+        except Exception:
+            logger.exception(
+                "Tesseract OCR failed for page %d (is tesseract installed? "
+                "e.g. `brew install tesseract`)",
+                page_number,
+            )
+            return ""
+    finally:
+        del pix
+        gc.collect()
 
 
 def _extract_pdf_text(
@@ -734,12 +734,13 @@ def _extract_pdf_text(
     progress_callback: ProgressCallback | None = None,
     should_cancel: CancelCheck | None = None,
 ) -> tuple[list[str], list[tuple[int, int]], str]:
-    """Extracts per-page text from a PDF on disk — pdfplumber reads
-    `pdf_path` directly rather than needing the whole file's bytes loaded
-    into memory first, same as the OCR fallback below. Returns (pages_text,
-    page_boundaries, full_text): `page_boundaries` pairs each page's start
-    offset within `full_text` with its 1-based page number, mirroring how
-    the pages were joined below.
+    """Extracts per-page text from a PDF on disk — PyMuPDF (fitz) opens
+    `pdf_path` directly and streams each page's text without ever loading
+    the whole document into memory at once, same as the OCR fallback
+    below. Returns (pages_text, page_boundaries, full_text):
+    `page_boundaries` pairs each page's start offset within `full_text`
+    with its 1-based page number, mirroring how the pages were joined
+    below.
 
     Falls back to OCR for any page with no extractable text layer (a
     scanned/image-only page), so the two-stage Gemini pipeline — and the
@@ -751,21 +752,21 @@ def _extract_pdf_text(
     page_boundaries: list[tuple[int, int]] = []
     offset = 0
 
-    with pdfplumber.open(pdf_path) as pdf:
-        total_pages = len(pdf.pages)
-        for page_number, page in enumerate(pdf.pages, start=1):
+    with fitz.open(pdf_path) as doc:
+        total_pages = doc.page_count
+        for page_number in range(1, total_pages + 1):
             _check_cancelled(should_cancel)
-            text = page.extract_text() or ""
+            text = doc[page_number - 1].get_text("text") or ""
             if not text.strip():
                 logger.info(
-                    "Page %d had no extractable text via pdfplumber — falling back to OCR "
+                    "Page %d had no extractable text via PyMuPDF — falling back to OCR "
                     "(likely a scanned/image-only page).",
                     page_number,
                 )
                 _report_progress(
                     progress_callback, f"Running OCR: Page {page_number} of {total_pages}"
                 )
-                text = _ocr_page(pdf_path, page_number)
+                text = _ocr_page(doc, page_number)
                 if not text.strip():
                     logger.warning(
                         "OCR also produced no text for page %d — skipping this page.",
@@ -1469,7 +1470,7 @@ def extract_signals_from_pdf(
 
     Only ever sends extracted plain text to Gemini, never the PDF file
     itself or any image/graphic from it: _extract_pdf_text below reads the
-    file once, up front, via pdfplumber (OCR for any page with no text
+    file once, up front, via PyMuPDF (OCR for any page with no text
     layer), and every Gemini call after that — see _call_gemini — takes a
     plain Python string as its payload.
 
